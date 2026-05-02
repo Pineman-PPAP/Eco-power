@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files (never commit real SCADA/NWP data)
+data/raw/
+data/processed/
+*.csv
+*.parquet
+*.h5
+
+# Model artifacts (can be large)
+models/saved/
+*.pkl
+*.joblib
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
