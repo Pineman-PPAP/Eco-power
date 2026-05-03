@@ -1041,7 +1041,7 @@ with map_col:
         unsafe_allow_html=True
     )
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio", "Live Generation"])
 
     with tab1:
         action_col, hint_col = st.columns([0.22, 0.78], gap="large")
@@ -1256,6 +1256,61 @@ with map_col:
             )
             st.plotly_chart(fig, use_container_width=True)
             st.dataframe(totals_df, use_container_width=True)
+
+    with tab5:
+        st.markdown(
+            "<div class='narrative-box'>Real-time generation data scraped from KPTCL SLDC.</div>",
+            unsafe_allow_html=True,
+        )
+        
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🔄 Sync Live Data", use_container_width=True):
+                with st.spinner("Fetching latest data from SLDC..."):
+                    from src.data.scraper import run_scrape
+                    try:
+                        run_scrape()
+                        st.success("Synced!")
+                    except Exception as e:
+                        st.error(f"Scrape failed: {e}")
+                        
+        with col2:
+            st.info("Fetches latest NCEP and StateGen data into the local SQLite database.")
+            
+        # Read latest from DB
+        from src.data.scraper import DB_PATH
+        import sqlite3
+        
+        if DB_PATH.exists():
+            con = sqlite3.connect(DB_PATH)
+            try:
+                latest_stategen = pd.read_sql("SELECT * FROM stategen_readings ORDER BY scraped_at DESC LIMIT 1", con)
+                latest_ncep = pd.read_sql("SELECT * FROM ncep_readings ORDER BY scraped_at DESC", con)
+                
+                if not latest_stategen.empty:
+                    ts = latest_stategen.iloc[0]['sldc_ts']
+                    st.markdown(f"**Last SLDC Update:** `{ts}`")
+                    
+                if not latest_ncep.empty:
+                    latest_time = latest_ncep.iloc[0]['scraped_at']
+                    ncep_batch = latest_ncep[latest_ncep['scraped_at'] == latest_time]
+                    
+                    total_solar = ncep_batch['solar_mw'].sum()
+                    total_wind = ncep_batch['wind_mw'].sum()
+                    
+                    k1, k2 = st.columns(2)
+                    k1.markdown(metric_card("Total Solar", f"{total_solar:,.0f} MW", "amber"), unsafe_allow_html=True)
+                    k2.markdown(metric_card("Total Wind", f"{total_wind:,.0f} MW", "blue"), unsafe_allow_html=True)
+                    
+                    st.markdown("### 🌬️☀️ Solar & Wind Generation")
+                    st.dataframe(ncep_batch[['escom', 'solar_mw', 'wind_mw']], use_container_width=True, height=250)
+                    
+            except Exception as e:
+                st.warning("No data in DB yet or error reading. Click Sync Live Data.")
+            finally:
+                con.close()
+        else:
+            st.warning("Database not initialized. Click 'Sync Live Data' to fetch data.")
 
 with telemetry_col:
     st.markdown(

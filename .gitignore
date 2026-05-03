@@ -24,6 +24,7 @@ data/processed/
 *.csv
 *.parquet
 *.h5
+*.db
 
 # Model artifacts (can be large)
 models/saved/
