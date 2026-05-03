@@ -127,6 +127,8 @@ async def upload_scada(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
         _uploaded_scada = df
         _rebuild_features()
         return {
@@ -146,6 +148,8 @@ async def upload_nwp(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
         _uploaded_nwp = df
         _rebuild_features()
         return {
