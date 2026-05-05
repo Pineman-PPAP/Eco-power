@@ -21,9 +21,10 @@ SCADA_REQUIRED_COLS = [
     "timestamp", "plant_id", "plant_type", "installed_capacity_mw",
     "generation_mw", "availability_flag", "latitude", "longitude",
 ]
-NWP_REQUIRED_COLS = [
-    "timestamp", "plant_id", "ghi_wm2", "cloud_cover_pct",
-    "temperature_c", "wind_speed_ms", "wind_direction_deg",
+NWP_REQUIRED_COLS = ["timestamp", "plant_id"]
+NWP_OPTIONAL_COLS = [
+    "ghi_wm2", "cloud_cover_pct", "temperature_c",
+    "wind_speed_ms", "wind_direction_deg", "pressure_hpa", "humidity_pct"
 ]
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
@@ -44,7 +45,7 @@ def _validate_columns(df: pd.DataFrame, required: list, source: str) -> None:
 
 
 def _parse_timestamps(df: pd.DataFrame) -> pd.DataFrame:
-    df["timestamp"] = pd.to_datetime(df["timestamp"], infer_datetime_format=True, utc=False)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format='mixed', utc=True)
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
@@ -52,7 +53,7 @@ def _parse_timestamps(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Public loaders
 # --------------------------------------------------------------------------- #
-def load_scada(path: Optional[str] = None) -> pd.DataFrame:
+def load_scada(path: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     Load and validate SCADA generation data.
 
@@ -60,21 +61,26 @@ def load_scada(path: Optional[str] = None) -> pd.DataFrame:
     ----------
     path : str or None
         Absolute path to CSV/Parquet file. Defaults to data/raw/scada_generation.csv.
+    df : pd.DataFrame or None
+        Optional DataFrame to use instead of loading from path.
 
     Returns
     -------
     pd.DataFrame  with columns standardised and timestamp as datetime.
     """
-    if path is None:
-        path = RAW_DIR / "scada_generation.csv"
+    if df is None:
+        if path is None:
+            path = RAW_DIR / "scada_generation.csv"
 
-    path = Path(path)
-    logger.info(f"Loading SCADA data from {path}")
+        path = Path(path)
+        logger.info(f"Loading SCADA data from {path}")
 
-    if path.suffix == ".parquet":
-        df = pd.read_parquet(path)
+        if path.suffix == ".parquet":
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path, low_memory=False)
     else:
-        df = pd.read_csv(path, low_memory=False)
+        logger.info("Processing SCADA data from provided DataFrame")
 
     _validate_columns(df, SCADA_REQUIRED_COLS, "SCADA")
     df = _parse_timestamps(df)
@@ -99,7 +105,7 @@ def load_scada(path: Optional[str] = None) -> pd.DataFrame:
     return df
 
 
-def load_nwp(path: Optional[str] = None) -> pd.DataFrame:
+def load_nwp(path: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     Load and validate NWP weather forecast data.
 
@@ -107,35 +113,34 @@ def load_nwp(path: Optional[str] = None) -> pd.DataFrame:
     ----------
     path : str or None
         Absolute path to CSV/Parquet file. Defaults to data/raw/nwp_weather.csv.
+    df : pd.DataFrame or None
+        Optional DataFrame to use instead of loading from path.
 
     Returns
     -------
     pd.DataFrame  with numeric weather columns and datetime timestamps.
     """
-    if path is None:
-        path = RAW_DIR / "nwp_weather.csv"
+    if df is None:
+        if path is None:
+            path = RAW_DIR / "nwp_weather.csv"
 
-    path = Path(path)
-    logger.info(f"Loading NWP data from {path}")
+        path = Path(path)
+        logger.info(f"Loading NWP data from {path}")
 
-    if path.suffix == ".parquet":
-        df = pd.read_parquet(path)
+        if path.suffix == ".parquet":
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path, low_memory=False)
     else:
-        df = pd.read_csv(path, low_memory=False)
+        logger.info("Processing NWP data from provided DataFrame")
 
     _validate_columns(df, NWP_REQUIRED_COLS, "NWP")
     df = _parse_timestamps(df)
 
-    numeric_cols = ["ghi_wm2", "cloud_cover_pct", "temperature_c",
-                    "wind_speed_ms", "wind_direction_deg"]
-    optional_numeric = ["pressure_hpa", "humidity_pct"]
-    for col in numeric_cols + optional_numeric:
+    for col in NWP_OPTIONAL_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Add missing optional columns as NaN
-    for col in optional_numeric:
-        if col not in df.columns:
+        else:
             df[col] = np.nan
 
     logger.info(
@@ -167,10 +172,16 @@ def merge_datasets(scada: pd.DataFrame, nwp: pd.DataFrame) -> pd.DataFrame:
         logger.info(f"NWP frequency ({nwp_freq} min) > SCADA ({scada_freq} min) — upsampling NWP via ffill")
         nwp = _upsample_nwp(nwp, target_freq=f"{scada_freq}min")
 
-    merged = pd.merge(scada, nwp, on=["timestamp", "plant_id"], how="left")
+    merged = pd.merge(scada, nwp, on=["timestamp", "plant_id"], how="outer")
 
     # Report merge quality
-    weather_null_pct = merged["ghi_wm2"].isna().mean() * 100
+    if "ghi_wm2" in merged.columns:
+        weather_null_pct = merged["ghi_wm2"].isna().mean() * 100
+    elif "wind_speed_ms" in merged.columns:
+        weather_null_pct = merged["wind_speed_ms"].isna().mean() * 100
+    else:
+        weather_null_pct = 100.0
+
     logger.info(
         f"Merge complete: {len(merged):,} rows | "
         f"Weather null rate: {weather_null_pct:.1f}%"

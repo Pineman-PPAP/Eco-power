@@ -37,27 +37,63 @@ QUANTILE_LABELS = {0.10: "p10", 0.50: "p50", 0.90: "p90"}
 # --------------------------------------------------------------------------- #
 # LightGBM hyperparameters
 # --------------------------------------------------------------------------- #
-def get_lgb_params(quantile: float) -> dict:
-    """Return LightGBM parameters for quantile regression."""
-    return {
+def get_lgb_params(quantile: float, plant_type: str = "solar") -> dict:
+    """Return LightGBM parameters for quantile regression, differentiated by plant type."""
+    base_params = {
         "objective":        "quantile",
         "alpha":            quantile,
         "metric":           "quantile",
         "boosting_type":    "gbdt",
-        "n_estimators":     1000,
-        "learning_rate":    0.03,
-        "num_leaves":       63,
-        "max_depth":        -1,
-        "min_child_samples": 30,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq":     5,
-        "lambda_l1":        0.1,
-        "lambda_l2":        0.1,
-        "verbose":          -1,
         "n_jobs":           -1,
+        "verbose":          -1,
         "random_state":     42,
     }
+    
+    if plant_type == "wind":
+        # Wind hyperparameters — tuned for Karnataka wind corridor characteristics:
+        #
+        # Physics rationale:
+        #   - Wind power ∝ V³ (cubic), so the model needs enough leaves to
+        #     approximate the steep ramp between cut-in (~3 m/s) and rated
+        #     speed (~12 m/s), but not so many that it overfits gust noise.
+        #   - 23 input features (4 wind, 3 met, 7 cyclical time, 2 calendar,
+        #     3 lags, 6 rolling stats) → max_depth=8 is sufficient for the
+        #     interaction space without combinatorial explosion.
+        #   - Karnataka wind is monsoon-dominated (Jun-Sep) with high
+        #     inter-seasonal variance → stronger bagging helps generalize
+        #     across dry vs monsoon regimes.
+        #   - L1 regularization for feature selection (wind_u/wind_v may be
+        #     noisy if direction data is sparse), L2 to smooth leaf values.
+        #
+        specific_params = {
+            "n_estimators":      1500,       # enough trees for slow learning rate
+            "learning_rate":     0.015,      # slow learner → better generalization
+            "num_leaves":        95,         # 2^8-1 range; captures cubic curve
+            "max_depth":         8,          # bounded depth prevents gust overfitting
+            "min_child_samples": 50,         # wind PLF is heavy-tailed; need robust leaves
+            "min_split_gain":    0.01,       # skip trivial splits on noisy features
+            "feature_fraction":  0.75,       # decorrelate trees across 23 features
+            "bagging_fraction":  0.7,        # subsample rows for variance reduction
+            "bagging_freq":      5,          # re-sample every 5 iterations
+            "lambda_l1":         0.3,        # mild L1: prune weak wind_u/wind_v splits
+            "lambda_l2":         0.2,        # gentle L2: smooth leaf outputs
+        }
+    else:
+        # Solar hyperparameters (untouched)
+        specific_params = {
+            "n_estimators":     1000,
+            "learning_rate":    0.03,
+            "num_leaves":       63,
+            "max_depth":        -1,
+            "min_child_samples": 30,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq":     5,
+            "lambda_l1":        0.1,
+            "lambda_l2":        0.1,
+        }
+        
+    return {**base_params, **specific_params}
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +242,10 @@ def train_plant_type(df: pd.DataFrame,
     # Only keep feature columns that exist in the dataset
     feature_cols = [f for f in feature_cols if f in subset.columns]
     cat_features  = [c for c in CATEGORICAL_FEATURES if c in subset.columns]
+    for c in cat_features:
+        subset[c] = subset[c].astype("category")
+        if c not in feature_cols:
+            feature_cols.append(c)
 
     logger.info(
         f"\n{'='*60}\n"
@@ -234,7 +274,7 @@ def train_plant_type(df: pd.DataFrame,
             X_val   = val_df[feature_cols]
             y_val   = val_df[TARGET].values
 
-            params = get_lgb_params(quantile)
+            params = get_lgb_params(quantile, plant_type)
             model  = lgb.LGBMRegressor(**params)
 
             model.fit(
@@ -289,7 +329,7 @@ def save_models(models: dict, plant_type: str) -> None:
         logger.info(f"Model saved: {model_path}")
 
     # Save the feature list used for this plant type
-    feature_cols = SOLAR_FEATURES if plant_type == "solar" else WIND_FEATURES
+    feature_cols = (SOLAR_FEATURES if plant_type == "solar" else WIND_FEATURES) + CATEGORICAL_FEATURES
     meta_path = MODELS_DIR / f"{plant_type}_feature_cols.json"
     with open(meta_path, "w") as f:
         json.dump(feature_cols, f)
@@ -312,7 +352,7 @@ def load_feature_cols(plant_type: str) -> List[str]:
     """Load the feature column list for a plant type."""
     meta_path = MODELS_DIR / f"{plant_type}_feature_cols.json"
     if not meta_path.exists():
-        return SOLAR_FEATURES if plant_type == "solar" else WIND_FEATURES
+        return (SOLAR_FEATURES if plant_type == "solar" else WIND_FEATURES) + CATEGORICAL_FEATURES
     with open(meta_path) as f:
         return json.load(f)
 

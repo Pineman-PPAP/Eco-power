@@ -113,7 +113,8 @@ def mask_solar_at_night(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 def wind_direction_to_vectors(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert wind direction (0–360°) to U (eastward) and V (northward) components.
+    Convert wind direction (0–360°) to U (eastward) and V (northward) components,
+    and also provide raw Sine and Cosine components as requested.
 
     This prevents the model from treating 359° and 1° as far apart.
     """
@@ -121,8 +122,15 @@ def wind_direction_to_vectors(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy()
     wd_rad = np.radians(df["wind_direction_deg"])
-    df["wind_u"] = -df["wind_speed_ms"] * np.sin(wd_rad)   # eastward component
-    df["wind_v"] = -df["wind_speed_ms"] * np.cos(wd_rad)   # northward component
+    
+    # Vector components (speed-weighted)
+    df["wind_u"] = -df["wind_speed_ms"] * np.sin(wd_rad)
+    df["wind_v"] = -df["wind_speed_ms"] * np.cos(wd_rad)
+    
+    # Pure cyclical components
+    df["wind_dir_sin"] = np.sin(wd_rad)
+    df["wind_dir_cos"] = np.cos(wd_rad)
+    
     return df
 
 
@@ -292,13 +300,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = add_lag_features(df)
     df = add_rolling_features(df)
 
-    # Drop rows where lag features are NaN (first 24h per plant)
     lag_cols = [c for c in df.columns if c.startswith("plf_lag_")]
-    before = len(df)
-    df = df.dropna(subset=lag_cols).reset_index(drop=True)
+    # df = df.dropna(subset=lag_cols).reset_index(drop=True)
     logger.info(
-        f"Feature engineering complete. Rows after lag dropna: "
-        f"{len(df):,} (dropped {before - len(df):,} warmup rows)"
+        f"Feature engineering complete. Rows: {len(df):,}"
     )
     return df
 
@@ -318,6 +323,7 @@ SOLAR_FEATURES = [
 
 WIND_FEATURES = [
     "wind_speed_hub_ms", "wind_speed_ms", "wind_u", "wind_v",
+    "wind_dir_sin", "wind_dir_cos",
     "temperature_c", "pressure_hpa", "humidity_pct",
     "hour_sin", "hour_cos", "month_sin", "month_cos", "doy_sin", "doy_cos",
     "block_of_day", "is_weekend",

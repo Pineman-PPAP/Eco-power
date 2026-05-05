@@ -13,7 +13,7 @@ Endpoints:
 All forecast outputs include P10/P50/P90 quantiles and confidence flags.
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
@@ -24,18 +24,28 @@ import logging
 import json
 from pathlib import Path
 from datetime import date
+import threading
+import sqlite3
+from datetime import datetime
 
 from src.data.loader import load_scada, load_nwp, merge_datasets
 from src.data.cleaner import clean
 from src.features.engineering import build_features, SOLAR_FEATURES, WIND_FEATURES
-from src.models.predict import (
-    predict_plant, predict_portfolio, aggregate_cluster,
-    format_sldc_schedule, persistence_fallback, load_models
-)
-from src.models.explainability import (
-    explain_forecast_block, compute_global_importance
-)
-from src.models.train import load_feature_cols
+
+# Protected ML imports to prevent system hangs
+ML_AVAILABLE = False
+try:
+    from src.models.predict import (
+        predict_plant, predict_portfolio, aggregate_cluster,
+        format_sldc_schedule, persistence_fallback, load_models
+    )
+    from src.models.explainability import (
+        explain_forecast_block, compute_global_importance
+    )
+    from src.models.train import load_feature_cols
+    ML_AVAILABLE = True
+except Exception as e:
+    logging.warning(f"ML components unavailable due to import error: {e}. Check LightGBM installation.")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -45,6 +55,8 @@ logger = logging.getLogger(__name__)
 _uploaded_scada: Optional[pd.DataFrame] = None
 _uploaded_nwp:   Optional[pd.DataFrame] = None
 _feature_df:     Optional[pd.DataFrame] = None
+_sldc_sync_lock = threading.Lock()
+_last_sldc_sync: Optional[datetime] = None
 
 app = FastAPI(
     title="Renewable Generation Forecasting API",
@@ -62,6 +74,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Startup complete (Fast mode)")
+    return
+
 
 
 # --------------------------------------------------------------------------- #
@@ -112,9 +131,29 @@ def _rebuild_features() -> None:
     if _uploaded_scada is None or _uploaded_nwp is None:
         return
     merged = merge_datasets(_uploaded_scada, _uploaded_nwp)
-    clean_df, _ = clean(merged)
-    _feature_df  = build_features(clean_df)
+    _, audit_df = clean(merged)
+    _feature_df  = build_features(audit_df)
     logger.info(f"Feature matrix rebuilt: {len(_feature_df):,} rows")
+
+
+def _sync_sldc_if_stale(max_age_seconds: int = 55) -> None:
+    """Refresh KPTCL SLDC data at most once per minute."""
+    global _last_sldc_sync
+    now = datetime.now()
+    if _last_sldc_sync and (now - _last_sldc_sync).total_seconds() < max_age_seconds:
+        return
+    if not _sldc_sync_lock.acquire(blocking=False):
+        return
+    try:
+        if _last_sldc_sync and (now - _last_sldc_sync).total_seconds() < max_age_seconds:
+            return
+        from src.data.scraper import run_scrape
+        run_scrape()
+        _last_sldc_sync = datetime.now()
+    except Exception as exc:
+        logger.warning("SLDC sync failed: %s", exc)
+    finally:
+        _sldc_sync_lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -126,15 +165,17 @@ async def upload_scada(file: UploadFile = File(...)):
     global _uploaded_scada
     try:
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        raw_df = pd.read_csv(io.BytesIO(contents))
+        
+        # Use shared loader for validation and preprocessing
+        df = load_scada(df=raw_df)
 
         _uploaded_scada = df
         _rebuild_features()
         return {
             "status":    "ok",
             "rows":      len(df),
-            "plants":    df["plant_id"].nunique() if "plant_id" in df.columns else "unknown",
+            "plants":    df["plant_id"].nunique(),
             "message":   "SCADA data uploaded and processed successfully.",
         }
     except Exception as e:
@@ -147,8 +188,10 @@ async def upload_nwp(file: UploadFile = File(...)):
     global _uploaded_nwp
     try:
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        raw_df = pd.read_csv(io.BytesIO(contents))
+        
+        # Use shared loader for validation and preprocessing
+        df = load_nwp(df=raw_df)
 
         _uploaded_nwp = df
         _rebuild_features()
@@ -159,6 +202,49 @@ async def upload_nwp(file: UploadFile = File(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+# --------------------------------------------------------------------------- #
+# Real-Time Ingestion Endpoints
+# --------------------------------------------------------------------------- #
+_training_lock = threading.Lock()
+
+def _run_background_training():
+    if not _training_lock.acquire(blocking=False):
+        logger.warning("Active training already in progress. Skipping duplicate trigger.")
+        return
+    try:
+        from src.models.train import run_training
+        logger.info("Background active training started via real-time ingestion API.")
+        run_training()
+        logger.info("Background active training completed successfully.")
+    except Exception as e:
+        logger.error(f"Background training failed: {e}")
+    finally:
+        _training_lock.release()
+
+@app.post("/ingest/scada", summary="Ingest real-time SCADA data and trigger active training")
+async def ingest_scada(records: List[Dict], background_tasks: BackgroundTasks):
+    try:
+        df = pd.DataFrame(records)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.to_csv("data/raw/scada_generation.csv", mode="a", header=False, index=False)
+        logger.info(f"Appended {len(df)} real-time SCADA records.")
+        background_tasks.add_task(_run_background_training)
+        return {"status": "ok", "message": f"Appended {len(df)} SCADA records. Active training triggered."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/ingest/nwp", summary="Ingest real-time NWP weather data and trigger active training")
+async def ingest_nwp(records: List[Dict], background_tasks: BackgroundTasks):
+    try:
+        df = pd.DataFrame(records)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.to_csv("data/raw/nwp_weather.csv", mode="a", header=False, index=False)
+        logger.info(f"Appended {len(df)} real-time NWP records.")
+        background_tasks.add_task(_run_background_training)
+        return {"status": "ok", "message": f"Appended {len(df)} NWP records. Active training triggered."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +273,13 @@ async def predict_plant_endpoint(req: PlantForecastRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     sldc = format_sldc_schedule(forecast, req.forecast_date)
+    if sldc.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data found for plant_id='{req.plant_id}' on {req.forecast_date}. "
+                   "Ensure SCADA and NWP data for this plant are uploaded."
+        )
+
     return {
         "plant_id":      req.plant_id,
         "forecast_date": req.forecast_date,
@@ -276,9 +369,27 @@ async def explain_block(
     return explanation
 
 
-# --------------------------------------------------------------------------- #
-# Health check
-# --------------------------------------------------------------------------- #
+@app.post("/reload", summary="Reload SCADA and NWP data from disk")
+async def reload_data():
+    """Manually trigger a reload of CSV files from the data/raw directory."""
+    global _uploaded_scada, _uploaded_nwp
+    scada_path = Path("data/raw/scada_generation.csv")
+    nwp_path = Path("data/raw/nwp_weather.csv")
+    
+    if scada_path.exists():
+        df = pd.read_csv(scada_path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        _uploaded_scada = df
+        
+    if nwp_path.exists():
+        df = pd.read_csv(nwp_path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        _uploaded_nwp = df
+        
+    _rebuild_features()
+    return {"status": "ok", "message": "Data reloaded and features rebuilt."}
+
+
 @app.get("/health", summary="Service health check")
 async def health():
     global _uploaded_scada, _uploaded_nwp, _feature_df
@@ -299,3 +410,251 @@ async def root():
         "docs":    "/docs",
         "health":  "/health",
     }
+
+
+@app.get("/sldc/generation", summary="Get historical SLDC solar and wind generation")
+async def get_sldc_generation(limit: int = 48):
+    """
+    Returns historical solar and wind generation data scraped from KPTCL SLDC.
+    Data is aggregated by timestamp.
+    """
+    _sync_sldc_if_stale()
+    db_path = Path("data/karnataka_solar.db")
+    if not db_path.exists():
+        return {"status": "error", "message": "SLDC database not found"}
+
+    try:
+        con = sqlite3.connect(db_path)
+        query = """
+            SELECT 
+                d.sldc_ts,
+                d.state_demand_mw,
+                d.total_generation_mw,
+                d.solar_mw,
+                d.wind_mw,
+                d.scraped_at
+            FROM default_readings
+            d
+            INNER JOIN (
+                SELECT sldc_ts, MAX(id) AS id
+                FROM default_readings
+                WHERE sldc_ts IS NOT NULL AND sldc_ts != ''
+                GROUP BY sldc_ts
+            ) latest
+              ON latest.id = d.id
+            ORDER BY d.scraped_at DESC
+            LIMIT ?
+        """
+        df = pd.read_sql(query, con, params=(limit,))
+        con.close()
+
+        # Sort chronological for the chart
+        df = df.sort_values("scraped_at")
+
+        return df.to_dict(orient="records")
+    except Exception as e:
+        logger.error(f"Failed to fetch SLDC data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sldc/status", summary="Get current SLDC grid status")
+async def get_sldc_status():
+    """
+    Returns the latest grid status including frequency and total generation.
+    """
+    _sync_sldc_if_stale()
+    db_path = Path("data/karnataka_solar.db")
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="SLDC database not found")
+
+    try:
+        con = sqlite3.connect(db_path)
+        default_query = """
+            SELECT *
+            FROM default_readings
+            ORDER BY scraped_at DESC
+            LIMIT 1
+        """
+        default_df = pd.read_sql(default_query, con)
+        
+        # Get latest total generation from stategen_readings
+        gen_query = """
+            SELECT total_gen_mw, ncep_mw, cgs_mw
+            FROM stategen_readings
+            ORDER BY scraped_at DESC
+            LIMIT 1
+        """
+        gen_df = pd.read_sql(gen_query, con)
+        con.close()
+
+        if default_df.empty:
+            raise HTTPException(status_code=404, detail="No SLDC data found")
+
+        latest = default_df.iloc[0]
+        status = {
+            "timestamp": latest["sldc_ts"],
+            "scraped_at": latest["scraped_at"],
+            "frequency": latest["frequency"],
+            "state_ui_mw": latest["state_ui_mw"],
+            "state_demand_mw": latest["state_demand_mw"],
+            "solar_mw": latest["solar_mw"],
+            "wind_mw": latest["wind_mw"],
+            "hydro_mw": latest["hydro_mw"],
+            "thermal_mw": latest["thermal_mw"],
+            "thermal_ipp_mw": latest["thermal_ipp_mw"],
+            "other_mw": latest["other_mw"],
+            "pavagada_solar_mw": latest["pavagada_solar_mw"],
+            "live_generation_mw": latest["total_generation_mw"] or (gen_df.iloc[0]["total_gen_mw"] if not gen_df.empty else 0),
+            "ncep_mw": latest["solar_mw"] + latest["wind_mw"],
+            "cgs_mw": gen_df.iloc[0]["cgs_mw"] if not gen_df.empty else 0,
+        }
+        
+        # Check staleness (if more than 30 mins old)
+        last_scrape = pd.to_datetime(status["scraped_at"])
+        is_stale = (pd.Timestamp.now() - last_scrape).total_seconds() > 1800
+        status["is_stale"] = is_stale
+        
+        return status
+    except Exception as e:
+        logger.error(f"Failed to fetch SLDC status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sldc/sync", summary="Fetch the latest KPTCL SLDC readings now")
+async def sync_sldc():
+    _sync_sldc_if_stale(max_age_seconds=0)
+    return {"status": "ok", "message": "SLDC sync attempted."}
+
+
+@app.get("/sldc/assets", summary="Get current SLDC asset/category breakdown")
+async def get_sldc_assets():
+    _sync_sldc_if_stale()
+    db_path = Path("data/karnataka_solar.db")
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="SLDC database not found")
+
+    try:
+        con = sqlite3.connect(db_path)
+        default_df = pd.read_sql(
+            "SELECT * FROM default_readings ORDER BY scraped_at DESC LIMIT 1",
+            con,
+        )
+        ncep_df = pd.read_sql(
+            """
+            SELECT *
+            FROM ncep_readings
+            WHERE scraped_at = (SELECT MAX(scraped_at) FROM ncep_readings)
+            ORDER BY escom
+            """,
+            con,
+        )
+        plant_df = pd.read_sql(
+            """
+            SELECT *
+            FROM stategen_readings
+            WHERE scraped_at = (SELECT MAX(scraped_at) FROM stategen_readings)
+            ORDER BY plant
+            """,
+            con,
+        )
+        con.close()
+
+        assets = []
+        if not default_df.empty:
+            latest = default_df.iloc[0]
+            categories = [
+                ("SOLAR", "Solar", "solar", latest["solar_mw"], latest["pavagada_solar_mw"]),
+                ("WIND", "Wind", "wind", latest["wind_mw"], None),
+                ("HYDRO", "Hydro", "hydro", latest["hydro_mw"], None),
+                ("THERMAL", "Thermal", "thermal", latest["thermal_mw"], None),
+                ("THERMAL_IPP", "Thermal IPP", "thermal", latest["thermal_ipp_mw"], None),
+                ("OTHER", "Other", "other", latest["other_mw"], None),
+            ]
+            for asset_id, name, kind, generation, child_generation in categories:
+                item = {
+                    "asset_id": asset_id,
+                    "name": name,
+                    "asset_type": kind,
+                    "generation_mw": float(generation or 0),
+                    "timestamp": latest["sldc_ts"],
+                    "source": "Default.aspx",
+                }
+                if child_generation is not None:
+                    item["pavagada_solar_mw"] = float(child_generation or 0)
+                assets.append(item)
+
+        for _, row in ncep_df.iterrows():
+            # Status logic for zones
+            solar = float(row["solar_mw"] or 0)
+            wind = float(row["wind_mw"] or 0)
+            
+            # Simple heuristic for status
+            # Solar Red if 0 during day (assuming day is 6-18)
+            # Wind Red if 0 (might be just no wind, but let's show red/yellow for effect)
+            hr = datetime.now().hour
+            is_day = 6 <= hr <= 18
+            
+            s_status = "green" if solar > 50 else ("yellow" if solar > 0 else ("red" if is_day else "green"))
+            w_status = "green" if wind > 50 else ("yellow" if wind > 0 else "red")
+
+            assets.append({
+                "asset_id": f"ZONE_S_{str(row['escom']).upper()}",
+                "name": f"{row['escom']} Solar",
+                "asset_type": "solar",
+                "generation_mw": solar,
+                "status": s_status,
+                "timestamp": row["sldc_ts"],
+                "source": "StateNCEP.aspx",
+            })
+            assets.append({
+                "asset_id": f"ZONE_W_{str(row['escom']).upper()}",
+                "name": f"{row['escom']} Wind",
+                "asset_type": "wind",
+                "generation_mw": wind,
+                "status": w_status,
+                "timestamp": row["sldc_ts"],
+                "source": "StateNCEP.aspx",
+            })
+
+        for _, row in plant_df.iterrows():
+            gen = float(row["generation_mw"] or 0)
+            cap = float(row["capacity_mw"] or 0)
+            status = "green"
+            if cap > 0:
+                load_factor = gen / cap
+                if load_factor < 0.05: status = "red"
+                elif load_factor < 0.2: status = "yellow"
+            
+            assets.append({
+                "asset_id": f"PLANT_{str(row['plant']).upper().replace(' ', '_')}",
+                "name": row["plant"],
+                "asset_type": "conventional_plant",
+                "capacity_mw": cap,
+                "generation_mw": gen,
+                "status": status,
+                "timestamp": row["sldc_ts"],
+                "source": "StateGen.aspx",
+            })
+
+        # Add Pavagada explicitly
+        if not default_df.empty:
+            pav = float(default_df.iloc[0]["pavagada_solar_mw"] or 0)
+            assets.append({
+                "asset_id": "PLANT_PAVAGADA",
+                "name": "Pavagada Solar Park",
+                "asset_type": "solar",
+                "capacity_mw": 2050.0,
+                "generation_mw": pav,
+                "status": "green" if pav > 100 else ("yellow" if pav > 0 else "red"),
+                "timestamp": default_df.iloc[0]["sldc_ts"],
+                "source": "Default.aspx",
+            })
+
+        return {"assets": assets}
+    except Exception as e:
+        logger.error("Failed to fetch SLDC assets: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8080)

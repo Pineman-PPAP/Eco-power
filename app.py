@@ -10,6 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 
 st.set_page_config(
@@ -20,6 +21,9 @@ st.set_page_config(
 )
 
 API_URL = "http://localhost:8000"
+
+# Auto-refresh every 15 minutes
+st_autorefresh(interval=15 * 60 * 1000, key="fcrefresh")
 
 
 st.markdown(
@@ -696,7 +700,12 @@ def build_karnataka_map(sites: pd.DataFrame) -> go.Figure:
 
 def plot_forecast(schedule_df: pd.DataFrame, plant_id: str, capacity_mw: float) -> go.Figure:
     fig = go.Figure()
-    times = schedule_df["time_from"]
+    
+    # Use timestamp for robust 24h scaling
+    if "timestamp" in schedule_df.columns:
+        times = pd.to_datetime(schedule_df["timestamp"])
+    else:
+        times = schedule_df["time_from"]
 
     fig.add_trace(
         go.Scatter(
@@ -747,12 +756,25 @@ def plot_forecast(schedule_df: pd.DataFrame, plant_id: str, capacity_mw: float) 
         annotation_font_color="#ffb95f",
     )
 
+    # Determine x-axis range (at least 24 hours)
+    if not schedule_df.empty and "timestamp" in schedule_df.columns:
+        start_time = times.min().floor('D')
+        end_time = start_time + pd.Timedelta(days=1)
+        xaxis_range = [start_time, end_time]
+    else:
+        xaxis_range = None
+
     fig.update_layout(
         title=dict(
             text=f"<b>24-hour generation forecast - {plant_id}</b>",
             font=dict(color="#f8fbff", size=16),
         ),
-        xaxis=dict(title="Time", color="#94a3b8", gridcolor="#1f2a44"),
+        xaxis=dict(
+            title="Time", 
+            color="#94a3b8", 
+            gridcolor="#1f2a44",
+            range=xaxis_range
+        ),
         yaxis=dict(
             title="Generation (MW)",
             color="#94a3b8",
@@ -922,11 +944,33 @@ with st.sidebar:
     current_plant = selected_row.iloc[0]
 
     st.markdown("### Forecast Settings")
-    plant_id = st.text_input("Plant ID", value=current_plant["plant_id"])
-    plant_type = st.selectbox("Plant Type", ["solar", "wind"], index=0 if current_plant["plant_type"] == "solar" else 1)
-    capacity = st.number_input("Installed Capacity (MW)", min_value=1.0, value=float(current_plant["capacity_mw"]), step=10.0)
     fc_date = st.date_input("Forecast Date", value=date.today() + timedelta(days=1))
     use_fallback = st.checkbox("Use Persistence Fallback (no NWP)")
+
+    if st.button("🔄 Sync Live Weather"):
+        with st.spinner("Fetching forecasts from Open-Meteo..."):
+            try:
+                import subprocess
+                subprocess.run(["python", "fetch_live_weather.py"], check=True)
+                resp = requests.post(f"{API_URL}/reload")
+                if resp.status_code == 200:
+                    st.success("Weather data synchronized!")
+                    st.rerun()
+                else:
+                    st.error(f"API Reload failed: {resp.text}")
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+
+    st.divider()
+    st.markdown("### Backend Status")
+    try:
+        health_resp = requests.get(f"{API_URL}/health", timeout=5).json()
+        rows = health_resp.get("feature_rows", 0)
+        st.write(f"⚡ Features Ready: `{rows:,}` rows")
+        if rows == 0:
+            st.warning("⚠️ No weather data available. Click 'Sync Live Weather'.")
+    except:
+        st.error("❌ API Offline")
 
 
 status_text = "Live stream" if api_online else "Local UI"
@@ -1041,7 +1085,7 @@ with map_col:
         unsafe_allow_html=True
     )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio", "Live Generation"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio", "Live Generation", "Model Accuracy", "Time Horizon"])
 
     with tab1:
         action_col, hint_col = st.columns([0.22, 0.78], gap="large")
@@ -1051,40 +1095,59 @@ with map_col:
             pass  # Narrative removed per user request
 
         if generate_clicked:
-            with st.spinner("Running LightGBM quantile models..."):
+            with st.spinner("Running LightGBM models for all assets..."):
+                # Filter out the "GRID_TOTAL" placeholder if it exists in your sites_df
+                plants_to_predict = sites_df[sites_df["plant_type"].isin(["solar", "wind"])].to_dict(orient="records")
+                
                 payload = {
-                    "plant_id": plant_id,
-                    "plant_type": plant_type,
-                    "installed_capacity_mw": capacity,
+                    "plants": [
+                        {
+                            "plant_id": p["plant_id"],
+                            "plant_type": p["plant_type"],
+                            "installed_capacity_mw": p["capacity_mw"]
+                        } for p in plants_to_predict
+                    ],
                     "forecast_date": str(fc_date),
                     "use_fallback": use_fallback,
                 }
                 try:
-                    response = requests.post(f"{API_URL}/predict/plant", json=payload, timeout=30)
+                    response = requests.post(f"{API_URL}/predict/portfolio", json=payload, timeout=60)
                     if response.status_code != 200:
                         st.error(f"API error: {response.json().get('detail', response.text)}")
                     else:
                         data = response.json()
-                        st.session_state["schedule"] = pd.DataFrame(data["schedule"])
+                        st.session_state["portfolio_schedules"] = data["schedules"]
                         st.session_state["forecast_meta"] = data
+                        st.success(f"Generated forecasts for {len(data['schedules'])} plants.")
                 except Exception as exc:
                     st.error(f"Connection error: {exc}")
 
-        if "schedule" in st.session_state:
-            schedule = st.session_state["schedule"]
-            total_p50 = schedule["scheduled_gen_mw"].sum() * 0.25
-            avg_uncert = schedule["uncertainty_band_mw"].mean()
-            peak_mw = schedule["scheduled_gen_mw"].max()
-            low_conf = (schedule["confidence_flag"] == "LOW_CONFIDENCE").sum()
+        # Update display logic to use portfolio_schedules
+        if "portfolio_schedules" in st.session_state:
+            schedules = st.session_state["portfolio_schedules"]
+            current_id = st.session_state["selected_plant_id"]
+            
+            if current_id not in schedules:
+                st.info(f"No forecast available for {current_id}. Please generate one or check if data is uploaded.")
+            else:
+                schedule = pd.DataFrame(schedules[current_id])
+                # Ensure timestamp is datetime
+                schedule["timestamp"] = pd.to_datetime(schedule["timestamp"])
+                st.session_state["schedule"] = schedule
+                
+                total_p50 = schedule["scheduled_gen_mw"].sum() * 0.25
+                avg_uncert = schedule["uncertainty_band_mw"].mean()
+                peak_mw = schedule["scheduled_gen_mw"].max()
+                low_conf = (schedule["confidence_flag"] == "LOW_CONFIDENCE").sum()
 
-            k1, k2, k3, k4 = st.columns(4)
-            k1.markdown(metric_card("Total Energy P50", f"{total_p50:.1f} MWh", "teal"), unsafe_allow_html=True)
-            k2.markdown(metric_card("Peak Generation", f"{peak_mw:.1f} MW", "amber"), unsafe_allow_html=True)
-            k3.markdown(metric_card("Avg Uncertainty", f"{avg_uncert:.1f} MW", "blue"), unsafe_allow_html=True)
-            k4.markdown(metric_card("Low Confidence", f"{low_conf} blocks"), unsafe_allow_html=True)
+                k1, k2, k3, k4 = st.columns(4)
+                k1.markdown(metric_card("Total Energy P50", f"{total_p50:.1f} MWh", "teal"), unsafe_allow_html=True)
+                k2.markdown(metric_card("Peak Generation", f"{peak_mw:.1f} MW", "amber"), unsafe_allow_html=True)
+                k3.markdown(metric_card("Avg Uncertainty", f"{avg_uncert:.1f} MW", "blue"), unsafe_allow_html=True)
+                k4.markdown(metric_card("Low Confidence", f"{low_conf} blocks"), unsafe_allow_html=True)
 
-            st.plotly_chart(plot_forecast(schedule, plant_id, capacity), use_container_width=True)
-            st.plotly_chart(plot_uncertainty_heatmap(schedule), use_container_width=True)
+                st.plotly_chart(plot_forecast(schedule, current_id, current_plant["capacity_mw"]), use_container_width=True)
+                st.plotly_chart(plot_uncertainty_heatmap(schedule), use_container_width=True)
 
     with tab2:
         st.markdown(
@@ -1092,34 +1155,40 @@ with map_col:
             unsafe_allow_html=True,
         )
 
-        if "schedule" not in st.session_state:
+        if "portfolio_schedules" not in st.session_state:
             st.info("Generate a forecast first.")
         else:
-            schedule = st.session_state["schedule"]
-            block_options = [
-                f"Block {row['block_no']:02d} - {row['time_from']} ({row['scheduled_gen_mw']:.1f} MW)"
-                for _, row in schedule.iterrows()
-            ]
-            selected = st.selectbox("Select Time Block to Explain", block_options)
-            block_no = int(selected.split(" ")[1]) - 1
-            selected_row = schedule.iloc[block_no]
-            ts_str = f"{fc_date}T{selected_row['time_from']}:00"
+            schedules = st.session_state["portfolio_schedules"]
+            current_id = st.session_state["selected_plant_id"]
+            
+            if current_id not in schedules:
+                st.info(f"No forecast available for {current_id}.")
+            else:
+                schedule = pd.DataFrame(schedules[current_id])
+                block_options = [
+                    f"Block {row['block_no']:02d} - {row['time_from']} ({row['scheduled_gen_mw']:.1f} MW)"
+                    for _, row in schedule.iterrows()
+                ]
+                selected = st.selectbox("Select Time Block to Explain", block_options)
+                block_no = int(selected.split(" ")[1]) - 1
+                selected_row = schedule.iloc[block_no]
+                ts_str = f"{fc_date}T{selected_row['time_from']}:00"
 
-            if st.button("Explain This Block"):
-                with st.spinner("Computing SHAP values..."):
-                    try:
-                        params = {
-                            "timestamp": ts_str,
-                            "plant_type": plant_type,
-                            "installed_capacity_mw": capacity,
-                        }
-                        response = requests.get(f"{API_URL}/explain/{plant_id}", params=params, timeout=30)
-                        if response.status_code == 200:
-                            st.session_state["explanation"] = response.json()
-                        else:
-                            st.error(response.json().get("detail", response.text))
-                    except Exception as exc:
-                        st.error(str(exc))
+                if st.button("Explain This Block"):
+                    with st.spinner("Computing SHAP values..."):
+                        try:
+                            params = {
+                                "timestamp": ts_str,
+                                "plant_type": current_plant["plant_type"],
+                                "installed_capacity_mw": current_plant["capacity_mw"],
+                            }
+                            response = requests.get(f"{API_URL}/explain/{current_id}", params=params, timeout=30)
+                            if response.status_code == 200:
+                                st.session_state["explanation"] = response.json()
+                            else:
+                                st.error(response.json().get("detail", response.text))
+                        except Exception as exc:
+                            st.error(str(exc))
 
             if "explanation" in st.session_state:
                 exp = st.session_state["explanation"]
@@ -1145,89 +1214,60 @@ with map_col:
                 st.markdown(f"<div class='narrative-box'>{exp.get('narrative', '')}</div>", unsafe_allow_html=True)
 
     with tab3:
-        if "schedule" not in st.session_state:
+        if "portfolio_schedules" not in st.session_state:
             st.info("Generate a forecast first.")
         else:
-            schedule = st.session_state["schedule"]
-            display_cols = [
-                "block_no",
-                "time_from",
-                "time_to",
-                "scheduled_gen_mw",
-                "p10_mw",
-                "p90_mw",
-                "uncertainty_band_mw",
-                "confidence_flag",
-            ]
-            available = [column for column in display_cols if column in schedule.columns]
+            schedules = st.session_state["portfolio_schedules"]
+            current_id = st.session_state["selected_plant_id"]
+            
+            if current_id not in schedules:
+                st.info(f"No forecast available for {current_id}.")
+            else:
+                schedule = pd.DataFrame(schedules[current_id])
+                display_cols = [
+                    "block_no",
+                    "time_from",
+                    "time_to",
+                    "scheduled_gen_mw",
+                    "p10_mw",
+                    "p90_mw",
+                    "uncertainty_band_mw",
+                    "confidence_flag",
+                ]
+                available = [column for column in display_cols if column in schedule.columns]
 
-            def highlight_confidence(row):
-                if row.get("confidence_flag") == "LOW_CONFIDENCE":
-                    return ["background-color: rgba(255, 119, 109, 0.22)"] * len(row)
-                if row.get("confidence_flag") == "HIGH_CONFIDENCE":
-                    return ["background-color: rgba(87, 241, 219, 0.14)"] * len(row)
-                return [""] * len(row)
+                def highlight_confidence(row):
+                    if row.get("confidence_flag") == "LOW_CONFIDENCE":
+                        return ["background-color: rgba(255, 119, 109, 0.22)"] * len(row)
+                    if row.get("confidence_flag") == "HIGH_CONFIDENCE":
+                        return ["background-color: rgba(87, 241, 219, 0.14)"] * len(row)
+                    return [""] * len(row)
 
-            st.dataframe(
-                schedule[available].style.apply(highlight_confidence, axis=1),
-                use_container_width=True,
-                height=420,
-            )
-            csv_bytes = schedule.to_csv(index=False).encode()
-            st.download_button(
-                "Download SLDC Schedule CSV",
-                data=csv_bytes,
-                file_name=f"sldc_schedule_{plant_id}_{fc_date}.csv",
-                mime="text/csv",
-            )
+                st.dataframe(
+                    schedule[available].style.apply(highlight_confidence, axis=1),
+                    use_container_width=True,
+                    height=420,
+                )
+                csv_bytes = schedule.to_csv(index=False).encode()
+                st.download_button(
+                    "Download SLDC Schedule CSV",
+                    data=csv_bytes,
+                    file_name=f"sldc_schedule_{current_id}_{fc_date}.csv",
+                    mime="text/csv",
+                )
 
     with tab4:
         st.markdown(
-            "<div class='narrative-box'>Enter multiple plants below to generate and compare forecasts across the fleet.</div>",
+            "<div class='narrative-box'>Aggregate portfolio metrics for all forecast assets.</div>",
             unsafe_allow_html=True,
         )
-        portfolio_input = st.text_area(
-            "Plant definitions: plant_id, plant_type, capacity_mw",
-            value="SOLAR_01,solar,50\nSOLAR_02,solar,100\nWIND_01,wind,75\nWIND_02,wind,120",
-            height=100,
-        )
-
-        if st.button("Run Portfolio Forecast"):
-            plants = []
-            for line in portfolio_input.strip().splitlines():
-                parts = [part.strip() for part in line.split(",")]
-                if len(parts) == 3:
-                    plants.append(
-                        {
-                            "plant_id": parts[0],
-                            "plant_type": parts[1],
-                            "installed_capacity_mw": float(parts[2]),
-                        }
-                    )
-
-            if not plants:
-                st.warning("No valid plant definitions found.")
-            else:
-                with st.spinner(f"Forecasting {len(plants)} plants..."):
-                    try:
-                        response = requests.post(
-                            f"{API_URL}/predict/portfolio",
-                            json={"forecast_date": str(fc_date), "plants": plants},
-                            timeout=60,
-                        )
-                        if response.status_code == 200:
-                            pdata = response.json()
-                            st.session_state["portfolio"] = pdata
-                            st.success(f"Forecasts generated for {pdata['n_plants']} plants")
-                        else:
-                            st.error(response.json().get("detail", response.text))
-                    except Exception as exc:
-                        st.error(str(exc))
-
-        if "portfolio" in st.session_state:
-            pdata = st.session_state["portfolio"]
+        
+        if "portfolio_schedules" not in st.session_state:
+            st.info("Generate a forecast first using the button in the 'Forecast' tab or sidebar.")
+        else:
+            schedules = st.session_state["portfolio_schedules"]
             totals = []
-            for pid, sched in pdata["schedules"].items():
+            for pid, sched in schedules.items():
                 df_sched = pd.DataFrame(sched)
                 totals.append(
                     {
@@ -1239,6 +1279,15 @@ with map_col:
                 )
             totals_df = pd.DataFrame(totals)
 
+            k1, k2, k3 = st.columns(3)
+            total_portfolio_mwh = totals_df["total_mwh_p50"].sum()
+            portfolio_peak = totals_df["peak_mw_p50"].max()
+            portfolio_uncert = totals_df["avg_uncertainty"].mean()
+            
+            k1.markdown(metric_card("Portfolio Energy", f"{total_portfolio_mwh:,.0f} MWh", "teal"), unsafe_allow_html=True)
+            k2.markdown(metric_card("Max Individual Peak", f"{portfolio_peak:.1f} MW", "amber"), unsafe_allow_html=True)
+            k3.markdown(metric_card("Avg Portfolio Risk", f"{portfolio_uncert:.1f} MW", "blue"), unsafe_allow_html=True)
+
             fig = px.bar(
                 totals_df,
                 x="plant_id",
@@ -1246,7 +1295,7 @@ with map_col:
                 color="avg_uncertainty",
                 color_continuous_scale=[[0, "#57f1db"], [0.5, "#ffb95f"], [1, "#ff776d"]],
                 labels={"total_mwh_p50": "Total Energy (MWh)", "avg_uncertainty": "Avg Uncertainty (MW)"},
-                title="Portfolio energy forecast P50 - day total",
+                title="Fleet Energy Forecast Summary",
             )
             fig.update_layout(
                 paper_bgcolor="#0b1326",
@@ -1311,6 +1360,68 @@ with map_col:
                 con.close()
         else:
             st.warning("Database not initialized. Click 'Sync Live Data' to fetch data.")
+
+    with tab6:
+        st.markdown(
+            "<div class='narrative-box'>Test the accuracy of the trained wind generation models against historical SCADA and NWP data.</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if st.button("Run Historical Accuracy Test", key="run_acc"):
+            with st.spinner("Testing model accuracy..."):
+                try:
+                    from test_accuracy import test_accuracy
+                    results = test_accuracy()
+                    
+                    if "error" in results:
+                        st.error(results["error"])
+                    else:
+                        st.markdown("### Evaluation Results")
+                        k1, k2, k3 = st.columns(3)
+                        k1.markdown(metric_card("Overall Accuracy", f"{results['accuracy']:.2f}%", "teal"), unsafe_allow_html=True)
+                        k2.markdown(metric_card("MAPE", f"{results['mape']:.2f}%", "amber"), unsafe_allow_html=True)
+                        k3.markdown(metric_card("Records Evaluated", f"{results['filtered_records']:,}", "blue"), unsafe_allow_html=True)
+                        
+                        st.success(f"Evaluated successfully on {results['records']:,} historical wind records.")
+                except Exception as e:
+                    st.error(f"Error testing accuracy: {e}")
+
+    with tab7:
+        st.markdown(
+            "<div class='narrative-box'>View the forecast broken down into specific time horizons: Short-term (next 4 hours) vs. Full Day (24 hours).</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if "schedule" not in st.session_state:
+            st.info("Please generate a forecast in the 'Forecast' tab first.")
+        else:
+            schedule = st.session_state["schedule"]
+            
+            st.markdown("### Next 4 Hours (Short-Term)")
+            # 4 hours * 4 blocks/hour = 16 blocks
+            short_term = schedule.head(16)
+            total_st = short_term["scheduled_gen_mw"].sum() * 0.25
+            peak_st = short_term["scheduled_gen_mw"].max()
+            
+            col_st1, col_st2 = st.columns(2)
+            col_st1.markdown(metric_card("Short-Term Energy", f"{total_st:.1f} MWh", "amber"), unsafe_allow_html=True)
+            col_st2.markdown(metric_card("Short-Term Peak", f"{peak_st:.1f} MW", "teal"), unsafe_allow_html=True)
+            
+            # Using key kwargs is not standard for plotly_chart, so we just render it directly
+            st.plotly_chart(plot_forecast(short_term, current_id, current_plant["capacity_mw"]), use_container_width=True)
+            
+            st.markdown("---")
+            st.markdown("### Next 24 Hours (Full Day)")
+            total_day = schedule["scheduled_gen_mw"].sum() * 0.25
+            peak_day = schedule["scheduled_gen_mw"].max()
+            
+            col_day1, col_day2 = st.columns(2)
+            col_day1.markdown(metric_card("Full Day Energy", f"{total_day:.1f} MWh", "amber"), unsafe_allow_html=True)
+            col_day2.markdown(metric_card("Full Day Peak", f"{peak_day:.1f} MW", "teal"), unsafe_allow_html=True)
+            
+            st.plotly_chart(plot_forecast(schedule, current_id, current_plant["capacity_mw"]), use_container_width=True)
 
 with telemetry_col:
     st.markdown(

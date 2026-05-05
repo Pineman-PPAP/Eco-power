@@ -58,12 +58,15 @@ def predict_plant(feature_df: pd.DataFrame,
         logger.warning(f"No data found for plant_id='{plant_id}'")
         return pd.DataFrame()
 
-    feature_cols = load_feature_cols(plant_type)
+    first_model = next(iter(models.values()))
+    feature_cols = getattr(first_model, "feature_name_", None) or load_feature_cols(plant_type)
     feature_cols = [f for f in feature_cols if f in plant_df.columns]
-    X = plant_df[feature_cols]
+    X = plant_df[feature_cols].copy()
+    _apply_model_categories(X, first_model)
 
     results = {}
     for q_label, model in models.items():
+        _apply_model_categories(X, model)
         pred_plf = model.predict(X).clip(0, 1)
         results[f"{q_label}_plf"] = pred_plf
         results[f"{q_label}_mw"]  = pred_plf * installed_capacity_mw
@@ -82,6 +85,17 @@ def predict_plant(feature_df: pd.DataFrame,
     out = _compute_uncertainty_flags(out, installed_capacity_mw)
 
     return out.reset_index(drop=True)
+
+
+def _apply_model_categories(X: pd.DataFrame, model: object) -> None:
+    """Match saved LightGBM pandas categorical metadata during inference."""
+    categories = getattr(getattr(model, "booster_", None), "pandas_categorical", None)
+    if not categories:
+        return
+
+    categorical_cols = [col for col in CATEGORICAL_FEATURES if col in X.columns]
+    for col, values in zip(categorical_cols, categories):
+        X[col] = pd.Categorical(X[col], categories=values)
 
 
 def _apply_physical_constraints(out: pd.DataFrame,
@@ -211,18 +225,11 @@ def format_sldc_schedule(plant_forecast: pd.DataFrame,
                           forecast_date: str) -> pd.DataFrame:
     """
     Format a plant forecast into the 96-block SLDC schedule structure.
-
-    Parameters
-    ----------
-    plant_forecast : output of predict_plant() for a single plant
-    forecast_date  : ISO date string (YYYY-MM-DD)
-
-    Returns
-    -------
-    DataFrame with 96 rows and columns:
-    [date, block_no, time_from, time_to, plant_id,
-     scheduled_gen_mw (P50), p10_mw, p90_mw, uncertainty_band_mw, confidence_flag]
     """
+    if plant_forecast is None or plant_forecast.empty:
+        logger.warning("Empty plant forecast provided to format_sldc_schedule")
+        return pd.DataFrame()
+
     date_ts = pd.Timestamp(forecast_date)
     # Filter to just the forecast day
     mask = plant_forecast["timestamp"].dt.date == date_ts.date()

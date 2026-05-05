@@ -10,7 +10,7 @@ Three-stage cleaning pipeline:
 import pandas as pd
 import numpy as np
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,8 @@ def filter_outages(df: pd.DataFrame,
         df["is_outage"] = False
         return df
 
-    df["is_outage"] = df[availability_col].astype(int) == 0
+    # Assume available if NaN (important for future forecasts where SCADA is missing)
+    df["is_outage"] = df[availability_col].fillna(1).astype(int) == 0
 
     n_outage = df["is_outage"].sum()
     pct = n_outage / len(df) * 100
@@ -165,7 +166,6 @@ def clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
       - training_df : records available for model training (no outage, no anomaly)
       - audit_df    : full dataset including flagged records (for reporting)
     """
-    from typing import Tuple  # local import to avoid circular on type hint
     df = filter_outages(df)
     df = detect_anomalies(df)
     df = impute_missing(df)
