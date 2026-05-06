@@ -858,6 +858,115 @@ def plot_uncertainty_heatmap(schedule_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def render_dispatch_simulator():
+    """Renders the Multi-Horizon Solar AI Dispatch Simulator tab."""
+    st.markdown(
+        "<div class='narrative-box'>Multi-Horizon Solar AI Dispatch Simulator: Monitoring grid anomalies and running live 'What-If' scenarios.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- 1. THE 10-DAY DASHBOARD ---
+    st.markdown("### 📊 10-Day Dispatch Performance")
+    try:
+        resp = requests.get(f"{API_URL}/api/dashboard/10-day", timeout=10)
+        if resp.status_code == 200:
+            payload = resp.json()["data"]
+            df_perf = pd.DataFrame(payload)
+            df_perf["timestamp"] = pd.to_datetime(df_perf["timestamp"])
+
+            # Financial Impact Math
+            tariff = 3.50
+            interval_hrs = 0.5 # 30-min data
+            # Calculate gap where pred > actual (Lost Energy)
+            df_perf["energy_gap_mwh"] = (df_perf["pred_nextday"] - df_perf["actual_mw"]).clip(lower=0) * interval_hrs
+            total_lost_energy = df_perf["energy_gap_mwh"].sum()
+            total_revenue_lost = total_lost_energy * 1000 * tariff # MW to kW
+
+            k1, k2, k3 = st.columns(3)
+            k1.markdown(metric_card("Revenue at Risk", f"₹{total_revenue_lost:,.0f}", "red"), unsafe_allow_html=True)
+            k2.markdown(metric_card("Energy Gap", f"{total_lost_energy:,.0f} MWh", "amber"), unsafe_allow_html=True)
+            k3.markdown(metric_card("Anomaly Events", f"{df_perf['is_anomaly'].sum()}", "blue"), unsafe_allow_html=True)
+
+            # Plotly Chart
+            fig = go.Figure()
+            # Actual Generation (Solid)
+            fig.add_trace(go.Scatter(
+                x=df_perf["timestamp"], y=df_perf["actual_mw"],
+                name="Actual Generation", line=dict(color="#facc15", width=2),
+                customdata=df_perf[["weather_ghi", "weather_temp", "weather_clouds"]],
+                hovertemplate="<b>Actual: %{y} MW</b><br>GHI: %{customdata[0]} W/m2<br>Temp: %{customdata[1]}C<br>Clouds: %{customdata[2]}%<extra></extra>"
+            ))
+            # Next-Day Prediction (Dashed)
+            fig.add_trace(go.Scatter(
+                x=df_perf["timestamp"], y=df_perf["pred_nextday"],
+                name="Next-Day Prediction", line=dict(color="#3b82f6", width=2, dash="dash"),
+                hovertemplate="<b>Predicted: %{y} MW</b><extra></extra>"
+            ))
+
+            # Anomaly Markers (Vertical shapes)
+            anomalies = df_perf[df_perf["is_anomaly"]]
+            for _, row in anomalies.iterrows():
+                fig.add_vline(x=row["timestamp"], line_width=1, line_dash="dot", line_color="#ff776d")
+
+            fig.update_layout(
+                paper_bgcolor="#0b1326", plot_bgcolor="#0f172a",
+                margin=dict(l=10, r=10, t=40, b=40), height=450,
+                xaxis=dict(title="Timeline (Asia/Kolkata)", color="#94a3b8", gridcolor="#1f2a44"),
+                yaxis=dict(title="Generation (MW)", color="#94a3b8", gridcolor="#1f2a44"),
+                legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center", font=dict(color="#cbd5e1"))
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("Could not fetch dashboard data from API.")
+    except Exception as e:
+        st.error(f"Backend Error: {e}")
+
+    st.markdown("---")
+
+    # --- 2. THE GOD MODE SANDBOX ---
+    st.markdown("### ⚡ 'What-If' Solar Sandbox")
+    st.info("Adjust weather modifiers to run live LightGBM inference on Day 1 data.")
+    
+    c1, c2 = st.columns(2)
+    cloud_mult = c1.slider("Cloud Cover Multiplier", 0.0, 3.0, 1.0, 0.1, help="Scales the Total Cloud Cover (TCC) feature.")
+    temp_off = c2.slider("Temperature Offset (°C)", -10.0, 10.0, 0.0, 1.0, help="Adds/subtracts from the ambient temperature.")
+
+    if st.button("Run Sandbox Simulation"):
+        with st.spinner("Running Live Inference..."):
+            try:
+                payload = {"cloud_cover_multiplier": cloud_mult, "temp_offset": temp_off}
+                s_resp = requests.post(f"{API_URL}/api/simulate", json=payload, timeout=10)
+                if s_resp.status_code == 200:
+                    s_data = s_resp.json()["data"]
+                    df_sim = pd.DataFrame(s_data)
+                    df_sim["timestamp"] = pd.to_datetime(df_sim["timestamp"])
+
+                    fig_sim = px.area(df_sim, x="timestamp", y="simulated_mw", 
+                                     title="Simulated Generation Curve",
+                                     color_discrete_sequence=["#3b82f6"])
+                    
+                    fig_sim.update_layout(
+                        paper_bgcolor="#0b1326", plot_bgcolor="#0f172a",
+                        margin=dict(l=10, r=10, t=40, b=40), height=350,
+                        xaxis=dict(title="Simulation Timeline", color="#94a3b8", gridcolor="#1f2a44"),
+                        yaxis=dict(title="Simulated MW", color="#94a3b8", gridcolor="#1f2a44")
+                    )
+                    st.plotly_chart(fig_sim, use_container_width=True)
+
+                    # Modified Weather Stats
+                    m1, m2, m3 = st.columns(3)
+                    # Take middle sample for stats
+                    mid_idx = len(df_sim) // 2
+                    m1.markdown(metric_card("Sim GHI", f"{df_sim.iloc[mid_idx]['modified_ghi']:.0f} W/m2"), unsafe_allow_html=True)
+                    m2.markdown(metric_card("Sim Temp", f"{df_sim.iloc[mid_idx]['modified_temp']:.1f} C"), unsafe_allow_html=True)
+                    m3.markdown(metric_card("Sim Clouds", f"{df_sim.iloc[mid_idx]['modified_clouds']:.0f}%"), unsafe_allow_html=True)
+                else:
+                    st.error("Simulation failed at backend.")
+            except Exception as e:
+                st.error(f"Simulation error: {e}")
+
+
 def metric_card(label: str, value: str, tone: str = "") -> str:
     return f"""
     <div class="mini-metric">
@@ -1085,7 +1194,7 @@ with map_col:
         unsafe_allow_html=True
     )
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio", "Live Generation", "Model Accuracy", "Time Horizon"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["Forecast", "Explainability", "SLDC Schedule", "Portfolio", "Live Generation", "Model Accuracy", "Time Horizon", "AI Dispatch Simulator"])
 
     with tab1:
         action_col, hint_col = st.columns([0.22, 0.78], gap="large")
@@ -1422,6 +1531,9 @@ with map_col:
             col_day2.markdown(metric_card("Full Day Peak", f"{peak_day:.1f} MW", "teal"), unsafe_allow_html=True)
             
             st.plotly_chart(plot_forecast(schedule, current_id, current_plant["capacity_mw"]), use_container_width=True)
+
+    with tab8:
+        render_dispatch_simulator()
 
 with telemetry_col:
     st.markdown(

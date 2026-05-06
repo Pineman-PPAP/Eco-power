@@ -10,7 +10,13 @@ interface GridStatusData {
   is_stale: boolean;
 }
 
-const GridStatus: React.FC = () => {
+interface GridStatusProps {
+  solarTotal?: number | null;
+  forecastTotal?: number | null;
+  isHovering?: boolean;
+}
+
+const GridStatus: React.FC<GridStatusProps> = ({ solarTotal, forecastTotal, isHovering }) => {
   const [data, setData] = useState<GridStatusData | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -54,9 +60,17 @@ const GridStatus: React.FC = () => {
       />
       <StatusCard 
         title="Solar Component" 
-        value={formatValue(data?.solar_mw)} 
-        trend="+0.8%" 
+        value={solarTotal !== null && solarTotal !== undefined ? `${solarTotal.toLocaleString(undefined, { maximumFractionDigits: 1 })} MWh` : '0 MWh'} 
+        trend={isHovering ? "Live Meter" : "Daily Total"} 
         color="amber" 
+        subtitle={isHovering ? "Cumulative Generated" : "Selected Day Energy"}
+      />
+      <StatusCard 
+        title="Forecast Potential" 
+        value={forecastTotal !== null && forecastTotal !== undefined ? `${forecastTotal.toLocaleString(undefined, { maximumFractionDigits: 1 })} MWh` : '0 MWh'} 
+        trend="Next-Day" 
+        color="purple" 
+        subtitle="Predicted Tomorrow"
       />
       <StatusCard 
         title="Wind Component" 
