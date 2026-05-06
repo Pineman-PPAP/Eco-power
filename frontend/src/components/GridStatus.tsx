@@ -23,7 +23,7 @@ const GridStatus: React.FC<GridStatusProps> = ({ solarTotal, forecastTotal, isHo
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const response = await fetch('http://127.0.0.1:8080/sldc/status');
+        const response = await fetch('http://127.0.0.1:8000/sldc/status');
         const result = await response.json();
         if (result && !result.detail) {
           setData(result);
