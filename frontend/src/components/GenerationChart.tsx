@@ -92,34 +92,35 @@ const GenerationChart: React.FC<GenerationChartProps> = ({
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const response = await fetch(`http://localhost:8000/api/dashboard/10-day?start_date=${selectedDate}`);
+        const response = await fetch(`http://localhost:8000/api/live-prediction`);
         const result = await response.json();
+        
         if (Array.isArray(result)) {
           setData(result);
           
-          // Calculate Total MWh for Day 1: sum(actual_mw) * 0.5h
-          const firstDay = result.filter((_, i) => i < 48); 
-          const totalMWh = firstDay.reduce((acc, row) => acc + (row.actual_mw || 0), 0) * 0.5;
+          // Calculate Today's Potential
+          const todayData = result.filter((_, i) => i < 24); 
+          const totalMWh = todayData.reduce((acc, row) => acc + (row.pred_nextday || 0), 0);
           onTotalCalculated(totalMWh);
 
-          // Calculate Forecast Potential for Day 2: sum(pred_nextday) * 0.5h
-          const secondDay = result.slice(48);
-          const forecastMWh = secondDay.reduce((acc, row) => acc + (Number(row.pred_nextday) || 0), 0) * 0.5;
+          // Calculate Tomorrow's Potential
+          const tomorrowData = result.slice(24);
+          const forecastMWh = tomorrowData.reduce((acc, row) => acc + (row.pred_nextday || 0), 0);
           onForecastCalculated(forecastMWh);
 
-          // Report Anomalies to Parent
-          const foundAnomalies = result.filter(row => row.is_anomaly);
-          onAnomaliesFound(foundAnomalies);
+          onAnomaliesFound([]); // Clear anomalies for future forecast
         }
       } catch (error) {
-        console.error('Error fetching Solar AI data:', error);
+        console.error('Error fetching Live Solar AI data:', error);
       } finally {
         setLoading(false);
       }
     };
 
     fetchData();
-  }, [selectedDate]);
+    const interval = setInterval(fetchData, 30 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [onTotalCalculated, onForecastCalculated, onAnomaliesFound]);
 
   const handleSimulate = async () => {
     try {
@@ -192,19 +193,13 @@ const GenerationChart: React.FC<GenerationChartProps> = ({
     <div className="generation-chart-container">
       <div className="chart-header">
         <div className="header-text">
-          <span className="chart-subtitle">Real-time KPTCL SLDC Data</span>
-          <h2 className="chart-title">Solar & Wind Generation</h2>
+          <span className="chart-subtitle">Real-time Satellite Forecast (Nagpur)</span>
+          <h2 className="chart-title">Live 48-Hour AI Forecast (Open-Meteo)</h2>
         </div>
         <div className="last-updated">
-          <span className="date-label">Horizon Start:</span>
-          <input 
-            type="date" 
-            className="date-picker" 
-            value={selectedDate}
-            min="2016-01-01"
-            max="2020-12-20"
-            onChange={(e) => onDateChange(e.target.value)}
-          />
+          <button className="refresh-btn" onClick={() => window.location.reload()}>
+            🔄 Refresh Live Feed
+          </button>
         </div>
       </div>
 
@@ -234,15 +229,13 @@ const GenerationChart: React.FC<GenerationChartProps> = ({
               tick={{ fill: '#6b7280', fontSize: 10 }}
               tickFormatter={(ts) => {
                 const date = new Date(ts);
-                return date.toLocaleDateString('en-IN', {
-                  month: 'short',
-                  day: 'numeric',
+                return date.toLocaleTimeString('en-IN', {
                   hour: '2-digit',
                   minute: '2-digit',
                   hour12: false,
-                }).replace(',', '');
+                });
               }}
-              minTickGap={60}
+              minTickGap={40}
             />
             <YAxis 
               axisLine={false}
